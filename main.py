@@ -1,0 +1,30 @@
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import List, Optional
+
+app = FastAPI()
+
+class Request(BaseModel):
+    team_name: str
+    opponent_name: Optional[str] = None
+
+@app.post("/match-lineup-analysis")
+def analisar(req: Request):
+    return {
+        "team_name": req.team_name,
+        "opponent_name": req.opponent_name,
+        "probable_lineup": ["Jogador 1", "Jogador 2", "Jogador 3"],
+        "confirmed_absences": ["Lesionado 1"],
+        "doubtful_players": [],
+        "likely_rest_players": ["Titular poupado"],
+        "status": "misto",
+        "confidence": "media",
+        "summary": "Time deve ir misto baseado em rotação recente.",
+        "sources": [
+            {
+                "source_name": "Exemplo",
+                "source_type": "midia",
+                "url": "https://ge.globo.com"
+            }
+        ]
+    }
