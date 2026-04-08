@@ -1,8 +1,6 @@
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal
-from datetime import datetime
-import requests
 import feedparser
 from bs4 import BeautifulSoup
 from urllib.parse import quote_plus
@@ -10,8 +8,8 @@ import re
 
 app = FastAPI(
     title="Futebol Lineup Analysis API",
-    version="2.0.0",
-    description="API para análise de prováveis escalações com priorização de fontes confiáveis."
+    version="3.0.0",
+    description="API para análise de prováveis escalações com cruzamento de fontes confiáveis."
 )
 
 # =========================
@@ -34,6 +32,8 @@ class MatchLineupResponse(BaseModel):
     confirmed_absences: List[str]
     doubtful_players: List[str]
     likely_rest_players: List[str]
+    youth_players: List[str]
+    squad_composition: str
     status: Literal["forca_maxima", "misto", "reservas"]
     confidence: Literal["alta", "media", "baixa"]
     summary: str
@@ -47,22 +47,28 @@ SOURCE_PRIORITY = {
     "ge.globo.com": 5,
     "globoesporte.globo.com": 5,
     "espn.com.br": 4,
+    "sportv.globo.com": 4,
     "uol.com.br": 3,
     "lance.com.br": 3,
     "cnnbrasil.com.br": 2,
 }
 
-HIGH_PRIORITY_SOURCES = {"ge.globo.com", "globoesporte.globo.com", "espn.com.br"}
+HIGH_PRIORITY_SOURCES = {
+    "ge.globo.com",
+    "globoesporte.globo.com",
+    "espn.com.br",
+    "sportv.globo.com"
+}
 
-# palavras que indicam sinais relevantes
 REST_KEYWORDS = [
     "poupado", "poupados", "preservado", "preservados",
-    "rodízio", "time misto", "misto", "reservas", "poupar"
+    "rodízio", "rodizio", "time misto", "misto", "reservas",
+    "poupar", "poupa", "gestão física", "gestao fisica"
 ]
 
 FULL_STRENGTH_KEYWORDS = [
     "força máxima", "forca maxima", "titulares", "time ideal",
-    "escalação ideal", "força total"
+    "escalação ideal", "escalacao ideal", "força total", "forca total"
 ]
 
 ABSENCE_KEYWORDS = [
@@ -72,7 +78,8 @@ ABSENCE_KEYWORDS = [
 
 DOUBT_KEYWORDS = [
     "dúvida", "duvida", "incerto", "pode ficar fora", "ainda será avaliado",
-    "em observação", "transição", "transicao"
+    "ainda sera avaliado", "em observação", "em observacao",
+    "transição", "transicao"
 ]
 
 LIKELY_LINEUP_KEYWORDS = [
@@ -80,11 +87,24 @@ LIKELY_LINEUP_KEYWORDS = [
     "escalação provável", "escalacao provavel"
 ]
 
-# alguns nomes fortes para detectar jogadores citados em títulos/snippets
-COMMON_PLAYER_PREFIX = [
-    "sem ", "sem o ", "sem a ", "com ", "poupa ", "poupar ", "dúvida em ",
-    "duvida em ", "volta de ", "retorno de "
+YOUTH_KEYWORDS = [
+    "sub-20", "sub20", "base", "jovem", "jovens", "garoto", "garotos",
+    "cria", "crias", "meninos da base", "equipe alternativa"
 ]
+
+POSITION_WORDS = {
+    "goleiro", "lateral", "zagueiro", "volante", "meia", "atacante",
+    "centroavante", "ponta", "ala"
+}
+
+STOPWORDS_NAMES = {
+    "hoje", "amanhã", "amanha", "brasil", "copa", "série", "serie",
+    "clube", "time", "jogo", "rodada", "ge", "espn", "sportv",
+    "provável", "provavel", "escalação", "escalacao", "titulares",
+    "reservas", "base", "oficial", "técnico", "tecnico", "amazonas",
+    "remo", "flamengo", "palmeiras", "barcelona", "real", "madrid",
+    "vila", "nova", "primavera"
+}
 
 # =========================
 # FUNÇÕES AUXILIARES
@@ -101,20 +121,25 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
 
 def source_weight(link: str) -> int:
+    link = (link or "").lower()
     for domain, weight in SOURCE_PRIORITY.items():
         if domain in link:
             return weight
     return 1
 
 def source_name_from_link(link: str) -> str:
+    link = (link or "").lower()
     for domain in SOURCE_PRIORITY.keys():
         if domain in link:
             return domain
     return "outra_fonte"
 
 def source_type_from_link(link: str) -> str:
-    if "ge.globo.com" in link or "globoesporte.globo.com" in link or "espn.com.br" in link:
+    link = (link or "").lower()
+    if any(domain in link for domain in HIGH_PRIORITY_SOURCES):
         return "midia_esportiva"
+    if "oficial" in link:
+        return "oficial"
     return "outra"
 
 def build_queries(team_name: str, opponent_name: Optional[str]) -> List[str]:
@@ -126,25 +151,22 @@ def build_queries(team_name: str, opponent_name: Optional[str]) -> List[str]:
         queries.append(f"{versus} provável escalação")
         queries.append(f"{versus} poupados desfalques")
         queries.append(f"{versus} titulares reservas")
+        queries.append(f"{versus} time misto base sub-20")
+        queries.append(f"{versus} ge provável escalação")
+        queries.append(f"{versus} ESPN desfalques")
+        queries.append(f"{versus} sportv provável escalação")
     else:
         queries.append(f'{base} provável escalação')
         queries.append(f'{base} poupados desfalques')
         queries.append(f'{base} titulares reservas')
-
-    # consultas com preferência implícita para ge e veículos esportivos
-    if opponent_name:
-        queries.append(f'"{team_name}" "{opponent_name}" ge provável escalação')
-        queries.append(f'"{team_name}" "{opponent_name}" ESPN desfalques')
-    else:
-        queries.append(f'"{team_name}" ge provável escalação')
-        queries.append(f'"{team_name}" ESPN desfalques')
+        queries.append(f'{base} time misto base sub-20')
+        queries.append(f'{base} ge provável escalação')
+        queries.append(f'{base} ESPN desfalques')
+        queries.append(f'{base} sportv provável escalação')
 
     return queries
 
 def google_news_rss(query: str, limit: int = 8) -> List[dict]:
-    """
-    Busca notícias no Google News RSS.
-    """
     rss_url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
     feed = feedparser.parse(rss_url)
 
@@ -178,28 +200,58 @@ def deduplicate_news(items: List[dict]) -> List[dict]:
 
     return result
 
-def extract_named_entities_like_players(text: str) -> List[str]:
-    """
-    Heurística simples: tenta encontrar palavras após gatilhos como
-    'sem', 'poupa', 'dúvida em', etc.
-    Não é perfeito, mas ajuda no protótipo.
-    """
-    found = []
-    txt = text.strip()
+def looks_like_player_name(token: str) -> bool:
+    token = token.strip(".,:;!?()[]{}\"'")
+    if len(token) < 3:
+        return False
+    if token.lower() in STOPWORDS_NAMES:
+        return False
+    if token.lower() in POSITION_WORDS:
+        return False
+    return token[:1].isupper()
 
-    patterns = [
-        r"(?:sem|poupa|poupar|dúvida em|duvida em|volta de|retorno de)\s+([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-Za-zÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç\-]+)",
-        r"(?:sem o|sem a)\s+([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-Za-zÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç\-]+)",
+def extract_player_candidates(text: str) -> List[str]:
+    text = clean_html(text)
+    tokens = re.split(r"\s+", text)
+    found = []
+
+    # nomes isolados e compostos
+    for i, tok in enumerate(tokens):
+        tok_clean = tok.strip(".,:;!?()[]{}\"'")
+        if looks_like_player_name(tok_clean):
+            found.append(tok_clean)
+
+            if i + 1 < len(tokens):
+                nxt = tokens[i + 1].strip(".,:;!?()[]{}\"'")
+                if looks_like_player_name(nxt):
+                    full_name = f"{tok_clean} {nxt}"
+                    found.append(full_name)
+
+    # gatilhos específicos
+    trigger_patterns = [
+        r"(?:sem|poupa|poupar|dúvida em|duvida em|volta de|retorno de)\s+([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-Za-zÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç\-]+(?:\s+[A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-Za-zÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç\-]+)?)"
     ]
 
-    for pattern in patterns:
-        matches = re.findall(pattern, txt, flags=re.IGNORECASE)
+    for pattern in trigger_patterns:
+        matches = re.findall(pattern, text, flags=re.IGNORECASE)
         for m in matches:
-            candidate = m.strip()
-            if candidate and candidate.lower() not in {"time", "titular", "clássico", "jogo"}:
-                found.append(candidate)
+            found.append(m.strip())
 
-    return list(dict.fromkeys(found))
+    cleaned = []
+    for name in found:
+        name = name.strip()
+        if not name:
+            continue
+        low = name.lower()
+        if low in STOPWORDS_NAMES or low in POSITION_WORDS:
+            continue
+        cleaned.append(name)
+
+    return list(dict.fromkeys(cleaned))
+
+# =========================
+# ANÁLISE
+# =========================
 
 def analyze_news(items: List[dict]) -> dict:
     score_full = 0
@@ -209,10 +261,11 @@ def analyze_news(items: List[dict]) -> dict:
     confirmed_absences = []
     doubtful_players = []
     likely_rest_players = []
-    probable_lineup = []
+    youth_players = []
 
-    lineup_signals = []
+    player_score = {}
     has_high_priority_source = False
+    youth_signal_count = 0
 
     for item in items:
         title = item["title"]
@@ -224,26 +277,29 @@ def analyze_news(items: List[dict]) -> dict:
         if item["source_name"] in HIGH_PRIORITY_SOURCES:
             has_high_priority_source = True
 
-        # sinais de provável escalação
+        players_found = extract_player_candidates(text)
+
+        # Sinal forte de provável escalação
         if any(k in norm for k in LIKELY_LINEUP_KEYWORDS):
-            lineup_signals.append(title)
+            for p in players_found:
+                player_score[p] = player_score.get(p, 0) + (3 * weight)
 
         # força máxima
         if any(k in norm for k in FULL_STRENGTH_KEYWORDS):
             score_full += 2 * weight
+            for p in players_found:
+                player_score[p] = player_score.get(p, 0) + weight
 
         # misto / poupados
         if any(k in norm for k in REST_KEYWORDS):
             score_mixed += 2 * weight
-
-            # possíveis nomes citados
-            extracted = extract_named_entities_like_players(text)
+            extracted = extract_player_candidates(text)
             likely_rest_players.extend(extracted)
 
         # ausências
         if any(k in norm for k in ABSENCE_KEYWORDS):
             score_mixed += weight
-            extracted = extract_named_entities_like_players(text)
+            extracted = extract_player_candidates(text)
             if extracted:
                 confirmed_absences.extend(extracted)
             else:
@@ -251,7 +307,7 @@ def analyze_news(items: List[dict]) -> dict:
 
         # dúvidas
         if any(k in norm for k in DOUBT_KEYWORDS):
-            extracted = extract_named_entities_like_players(text)
+            extracted = extract_player_candidates(text)
             if extracted:
                 doubtful_players.extend(extracted)
             else:
@@ -261,16 +317,34 @@ def analyze_news(items: List[dict]) -> dict:
         if "reservas" in norm or "time alternativo" in norm:
             score_reserves += 3 * weight
 
-    confirmed_absences = list(dict.fromkeys(confirmed_absences))[:5]
-    doubtful_players = list(dict.fromkeys(doubtful_players))[:5]
-    likely_rest_players = list(dict.fromkeys(likely_rest_players))[:5]
+        # base / sub-20
+        if any(k in norm for k in YOUTH_KEYWORDS):
+            youth_signal_count += 1
+            extracted = extract_player_candidates(text)
+            if extracted:
+                youth_players.extend(extracted)
 
-    # escalação provável ainda é difícil sem scraper específico;
-    # aqui trazemos os melhores sinais encontrados
-    if lineup_signals:
-        probable_lineup = lineup_signals[:3]
-    else:
-        probable_lineup = ["Sem escalação estruturada confirmada nas fontes rastreadas"]
+        # reforça score geral dos jogadores citados
+        for p in players_found:
+            player_score[p] = player_score.get(p, 0) + weight
+
+    confirmed_absences = list(dict.fromkeys(confirmed_absences))[:6]
+    doubtful_players = list(dict.fromkeys(doubtful_players))[:6]
+    likely_rest_players = list(dict.fromkeys(likely_rest_players))[:6]
+    youth_players = list(dict.fromkeys(youth_players))[:6]
+
+    blocked = {x.lower() for x in confirmed_absences + likely_rest_players}
+    ranked_players = sorted(player_score.items(), key=lambda x: x[1], reverse=True)
+
+    probable_lineup = []
+    for name, _pts in ranked_players:
+        if name.lower() not in blocked:
+            probable_lineup.append(name)
+        if len(probable_lineup) >= 11:
+            break
+
+    if not probable_lineup:
+        probable_lineup = ["Sem escalação nominal consistente nas fontes rastreadas"]
 
     # decisão final
     if score_reserves >= max(score_full, score_mixed) and score_reserves >= 8:
@@ -279,6 +353,20 @@ def analyze_news(items: List[dict]) -> dict:
         status = "misto"
     else:
         status = "forca_maxima"
+
+    # composição do elenco
+    if status == "forca_maxima":
+        squad_composition = "predominância de titulares"
+    elif youth_signal_count >= 2 and likely_rest_players:
+        squad_composition = "time misto com reservas e uso de jogadores da base"
+    elif youth_signal_count >= 2:
+        squad_composition = "equipe com presença relevante de jogadores da base"
+    elif likely_rest_players:
+        squad_composition = "time misto com titulares e reservas"
+    elif status == "reservas":
+        squad_composition = "maioria reservas"
+    else:
+        squad_composition = "misto"
 
     # confiança
     if len(items) >= 6 and has_high_priority_source:
@@ -293,6 +381,8 @@ def analyze_news(items: List[dict]) -> dict:
         "confirmed_absences": confirmed_absences,
         "doubtful_players": doubtful_players,
         "likely_rest_players": likely_rest_players,
+        "youth_players": youth_players,
+        "squad_composition": squad_composition,
         "status": status,
         "confidence": confidence,
         "scores": {
@@ -319,6 +409,8 @@ def build_summary(
         reasons.append("há sinais de desfalques")
     if analysis["likely_rest_players"]:
         reasons.append("existem indícios de preservação de titulares")
+    if analysis["youth_players"]:
+        reasons.append("aparecem sinais de utilização de jogadores da base")
     if not reasons and analysis["status"] == "forca_maxima":
         reasons.append("não apareceram sinais fortes de rotação relevante")
     if not reasons:
@@ -327,7 +419,8 @@ def build_summary(
     versus = f" contra {opponent_name}" if opponent_name else ""
     return (
         f"O {team_name}{versus} tem tendência de atuar com {status_text}. "
-        f"A conclusão foi baseada em {source_count} sinais recentes, com prioridade para fontes esportivas mais confiáveis, "
+        f"A composição mais provável é: {analysis['squad_composition']}. "
+        f"A conclusão foi baseada em {source_count} sinais recentes, com prioridade para fontes esportivas confiáveis, "
         f"porque {', '.join(reasons)}."
     )
 
@@ -346,7 +439,7 @@ def analyze_match_lineup(payload: MatchLineupRequest):
         except Exception:
             continue
 
-    news_items = deduplicate_news(news_items)[:12]
+    news_items = deduplicate_news(news_items)[:15]
 
     analysis = analyze_news(news_items)
 
@@ -373,6 +466,8 @@ def analyze_match_lineup(payload: MatchLineupRequest):
         confirmed_absences=analysis["confirmed_absences"],
         doubtful_players=analysis["doubtful_players"],
         likely_rest_players=analysis["likely_rest_players"],
+        youth_players=analysis["youth_players"],
+        squad_composition=analysis["squad_composition"],
         status=analysis["status"],
         confidence=analysis["confidence"],
         summary=summary,
